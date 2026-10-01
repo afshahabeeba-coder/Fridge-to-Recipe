@@ -1,30 +1,51 @@
+import base64
 import json
+import time
 from urllib.parse import quote
 
 import streamlit as st
 from google import genai
 from google.genai import types
 from twilio.rest import Client as TwilioClient
+
+try:
+    from openai import OpenAI as OpenAIClient
+except ImportError:  # pragma: no cover
+    OpenAIClient = None
 from prompts import (
-    
     SYSTEM_PROMPT,
     INGREDIENT_DETECTION_PROMPT,
     RECIPE_PROMPT,
-    SYSTEM_PROMPT,
     WELCOME_MESSAGE,
 )
 
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-TWILIO_ACCOUNT_SID = st.secrets["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = st.secrets["TWILIO_AUTH_TOKEN"]
-TWILIO_WHATSAPP_FROM  = st.secrets["TWILIO_WHATSAPP_FROM"]
-TWILIO_CONTENT_SID  = st.secrets["TWILIO_CONTENT_SID"]
+
+def get_secret(name):
+    value = st.secrets.get(name)
+    if value in (None, ""):
+        raise RuntimeError(f"Missing required secret: {name}")
+    return value
 
 
+OPENAI_API_KEY = (st.secrets.get("OPENAI_API_KEY") or "").strip()
+GEMINI_API_KEY = (st.secrets.get("GEMINI_API_KEY") or "").strip()
+
+try:
+    TWILIO_ACCOUNT_SID = get_secret("TWILIO_ACCOUNT_SID")
+    TWILIO_AUTH_TOKEN = get_secret("TWILIO_AUTH_TOKEN")
+    TWILIO_WHATSAPP_FROM = get_secret("TWILIO_WHATSAPP_FROM")
+    TWILIO_CONTENT_SID = st.secrets.get("TWILIO_CONTENT_SID")
+except RuntimeError as error:
+    st.error(str(error))
+    st.stop()
+
+openai_client = OpenAIClient(api_key=OPENAI_API_KEY) if OPENAI_API_KEY and OpenAIClient else None
 
 
 @st.cache_resource
 def get_gemini_client():
+    if not GEMINI_API_KEY:
+        return None
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
@@ -35,24 +56,168 @@ def get_twilio_client():
 twilio_client = get_twilio_client()
 gemini_client = get_gemini_client()
 MODEL_NAME = "gemini-3.8-flash"
-FALLBACK_MODEL_NAME = "gemini-3.5-flash"
+FALLBACK_MODEL_NAME = "gemini-3.8-flash-lite"
+
+
+class LocalResponse:
+    def __init__(self, text):
+        self.text = text
+
+
+def build_local_recipe(ingredients, preferences=""):
+    ingredients = [item.strip() for item in ingredients if item and item.strip()]
+    if not ingredients:
+        ingredients = ["eggs", "rice", "onion", "tomato"]
+
+    ingredient_text = ", ".join(ingredients)
+    pref_note = "" if not preferences else f" \nDiet note: {preferences}."
+
+    return (
+        f"### Quick {ingredients[0].title()} Skillet\n"
+        f"- Time: 20 minutes\n"
+        f"- Difficulty: Easy\n"
+        f"- Uses: {ingredient_text}\n"
+        f"- Missing: None\n"
+        f"- Steps:\n"
+        "1. Heat a little oil in a pan.\n"
+        "2. Add the ingredients and cook until softened.\n"
+        "3. Season with salt, pepper, and any pantry spices you have.\n"
+        "4. Stir well and cook until everything is warm and tasty.\n"
+        "5. Serve hot and enjoy.\n"
+        f"\nTip: Use any extra vegetables or leftovers in the same pan so nothing goes to waste.{pref_note}"
+    )
+
+
+def extract_error_code(error):
+    for attr in ("code", "status_code", "status"):
+        value = getattr(error, attr, None)
+        if value is not None:
+            return value
+    return None
+
+
+def is_model_not_available_error(error):
+    text = str(error).lower()
+    return (
+        "not found" in text
+        or "unsupported" in text
+        or "not supported" in text
+        or "model" in text and "not" in text
+    )
+
+
+@st.cache_data(show_spinner=False)
+def get_available_gemini_models():
+    if gemini_client is None:
+        return []
+    try:
+        models = []
+        for model in gemini_client.models.list():
+            name = getattr(model, "name", str(model))
+            if isinstance(name, str):
+                name = name.split("/")[-1]
+            if name:
+                models.append(name)
+        return models
+    except Exception:
+        return []
+
+
+def get_gemini_model_candidates():
+    seen = set()
+    for model_name in (MODEL_NAME, FALLBACK_MODEL_NAME, "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-pro"):
+        if model_name and model_name not in seen:
+            seen.add(model_name)
+            yield model_name
+
+    for model_name in get_available_gemini_models():
+        if model_name and model_name not in seen:
+            seen.add(model_name)
+            yield model_name
+
+
+def build_openai_message(contents):
+    message_content = []
+    for item in contents if isinstance(contents, list) else [contents]:
+        if isinstance(item, str):
+            message_content.append({"type": "text", "text": item})
+        elif hasattr(item, "inline_data") and getattr(item, "inline_data", None) is not None:
+            inline_data = item.inline_data
+            mime_type = getattr(inline_data, "mime_type", None) or "image/jpeg"
+            image_bytes = getattr(inline_data, "data", b"")
+            if isinstance(image_bytes, memoryview):
+                image_bytes = image_bytes.tobytes()
+            base64_image = base64.b64encode(image_bytes).decode("utf-8")
+            message_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{base64_image}",
+                    },
+                }
+            )
+    return [{"role": "user", "content": message_content}]
+
+
+class OpenAIResponse:
+    def __init__(self, text):
+        self.text = text
+
+
+def generate_openai_content(contents, config=None):
+    messages = build_openai_message(contents)
+    text_prompt = ""
+    if isinstance(contents, list):
+        text_prompt = next((item for item in contents if isinstance(item, str)), "")
+    else:
+        text_prompt = contents if isinstance(contents, str) else ""
+
+    if not text_prompt and len(messages[0]["content"]) > 0:
+        for part in messages[0]["content"]:
+            if part.get("type") == "text":
+                text_prompt = part.get("text", "")
+                break
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        response_format={"type": "json_object"} if "ingredients" in text_prompt.lower() or "json" in text_prompt.lower() else None,
+    )
+    output = response.choices[0].message.content
+    return OpenAIResponse(output)
 
 
 def generate_content(contents, config=None):
-    try:
-        return gemini_client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents,
-            config=config,
-        )
-    except Exception as error:
-        if getattr(error, "code", None) != 503:
-            raise
-        return gemini_client.models.generate_content(
-            model=FALLBACK_MODEL_NAME,
-            contents=contents,
-            config=config,
-        )
+    if openai_client is not None:
+        try:
+            return generate_openai_content(contents, config)
+        except Exception:
+            st.warning("OpenAI fallback is active, but the request failed; retrying with Gemini only if a Gemini key is configured.")
+
+    if gemini_client is None:
+        if isinstance(contents, str) and "The user confirmed these ingredients" in contents:
+            return LocalResponse(build_local_recipe([item.strip() for item in contents.split("The user confirmed these ingredients:", 1)[1].split("\n", 1)[0].split(",") if item.strip()]))
+        raise RuntimeError("No AI provider is configured. Add a valid OpenAI key or a valid Gemini API key.")
+
+    candidates = list(get_gemini_model_candidates())
+    last_model = candidates[-1] if candidates else FALLBACK_MODEL_NAME
+
+    for model_name in candidates:
+        try:
+            return gemini_client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+        except Exception as error:
+            error_code = extract_error_code(error)
+            if error_code not in (429, 503) and not is_model_not_available_error(error):
+                raise
+            if model_name == last_model:
+                raise
+            st.warning(f"Gemini model '{model_name}' is unavailable or busy. Retrying with another supported model...")
+            time.sleep(2)
+    raise RuntimeError("Gemini request failed after retrying across supported models.")
 
 def clean_whatsapp_text(text):
     if not text:
@@ -60,19 +225,31 @@ def clean_whatsapp_text(text):
     text = " ".join(text.split())
     return text
 
-def send_whatsapp(to_number,user_name,summary):
-   try:
-       content_variable = json.dumps({"user_name": user_name, "summary": summary})
+def send_whatsapp(to_number, user_name, summary):
+    try:
+        sanitized_summary = clean_whatsapp_text(summary)
+        content_variables = {
+            "user_name": user_name,
+            "summary": sanitized_summary,
+        }
 
-       message = twilio_client.messages.create(
-           from_=TWILIO_WHATSAPP_FROM,
-           to=f"whatsapp:{to_number}",
-           content_sid=TWILIO_CONTENT_SID,
-           body=content_variable
-       )
-       return True,message.sid
-   except Exception as error:
-       st.error(f"Failed to send WhatsApp message ({type(error).__name__}): {error}")
+        if TWILIO_CONTENT_SID:
+            message = twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_FROM,
+                to=f"whatsapp:{to_number}",
+                content_sid=TWILIO_CONTENT_SID,
+                content_variables=content_variables,
+            )
+        else:
+            message = twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_FROM,
+                to=f"whatsapp:{to_number}",
+                body=f"Hi {user_name}! Here is your recipe:\n{sanitized_summary}",
+            )
+        return True, message.sid
+    except Exception as error:
+        st.error(f"Failed to send WhatsApp message ({type(error).__name__}): {error}")
+        return False, None
 
 def render_message(message):
     with st.chat_message(message["role"]): 
@@ -128,73 +305,112 @@ uploaded_file = st.file_uploader(
     type=["jpg", "jpeg", "png", "webp"],
 )
 
+if "manual_ingredients_mode" not in st.session_state:
+    st.session_state.manual_ingredients_mode = False
+
 if uploaded_file and st.button("Identify ingredients"):
-    with st.spinner("Taking a closer look at your photo..."):
-        try:
-            response = generate_content(
-                contents=[
-                    INGREDIENT_DETECTION_PROMPT,
-                    types.Part.from_bytes(
-                        data=uploaded_file.getvalue(),
-                        mime_type=uploaded_file.type or "image/jpeg",
-                    ),
-                ],
-                config=types.GenerateContentConfig(response_mime_type="application/json"),
-            )
-            detected = json.loads(response.text or "{}")
-            ingredients = detected.get("ingredients", [])
-            uncertain = detected.get("uncertain", [])
-            if not isinstance(ingredients, list) or not isinstance(uncertain, list):
-                raise ValueError("The ingredient response had an unexpected format.")
-            st.session_state.detected_ingredients = ingredients
-            st.session_state.uncertain_ingredients = uncertain
-            st.session_state.confirmed_ingredients = ", ".join(ingredients)
-        except Exception as error:
-            st.error(f"Photo analysis failed ({type(error).__name__}): {error}")
-
-if "detected_ingredients" in st.session_state:
-    uncertain = st.session_state.uncertain_ingredients
-    if uncertain:
-        st.info("I'm not sure about: " + ", ".join(uncertain))
-
-    ingredients_text = st.text_area(
-        "Check the ingredients and edit the list if needed",
-        key="confirmed_ingredients",
-    )
-    if st.button("Suggest recipes", type="primary"):
-        ingredients = [item.strip() for item in ingredients_text.split(",") if item.strip()]
-        if not ingredients:
-            st.error("Add at least one ingredient to get recipe ideas.")
-        else:
-            with st.spinner("Finding a few good things to make..."):
-                try:
-                    recipe_response = generate_content(
-                        contents=RECIPE_PROMPT.format(
-                            ingredients=", ".join(ingredients),
-                            preferences=st.session_state.user_preferences,
+    if openai_client is None and gemini_client is None:
+        st.session_state.manual_ingredients_mode = True
+        st.session_state.detected_ingredients = []
+        st.session_state.uncertain_ingredients = []
+        st.session_state.confirmed_ingredients = ""
+        st.info("No AI provider is configured. Enter the ingredients manually below and I’ll still suggest recipes.")
+    else:
+        with st.spinner("Taking a closer look at your photo..."):
+            try:
+                response = generate_content(
+                    contents=[
+                        INGREDIENT_DETECTION_PROMPT,
+                        types.Part.from_bytes(
+                            data=uploaded_file.getvalue(),
+                            mime_type=uploaded_file.type or "image/jpeg",
                         ),
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT
-                        ),
+                    ],
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                detected = json.loads(response.text or "{}")
+                ingredients = detected.get("ingredients", [])
+                uncertain = detected.get("uncertain", [])
+                if not isinstance(ingredients, list) or not isinstance(uncertain, list):
+                    raise ValueError("The ingredient response had an unexpected format.")
+                st.session_state.detected_ingredients = ingredients
+                st.session_state.uncertain_ingredients = uncertain
+                st.session_state.confirmed_ingredients = ", ".join(ingredients)
+                st.session_state.manual_ingredients_mode = False
+            except Exception as error:
+                error_code = extract_error_code(error)
+                if error_code in (429, 503):
+                    st.error(
+                        "The AI image analysis is temporarily unavailable because Gemini quota or service capacity was reached. "
+                        "Please try again in a few minutes, or switch to a different Google AI plan and model."
                     )
-                    recipe = (recipe_response.text or "").strip()
-                    if not recipe:
-                        st.error("I couldn't come up with a recipe just now. Please try again.")
-                    else:
-                        st.session_state.messages = [
-                            {
-                                "role": "assistant",
-                                "kind": "text",
-                                "category": "recipe",
-                                "content": recipe,
-                            }
-                        ]
-                except Exception as error:
-                    st.error(f"Recipe generation failed ({type(error).__name__}): {error}")
+                else:
+                    st.error(f"Photo analysis failed ({type(error).__name__}): {error}")
+                st.session_state.manual_ingredients_mode = True
+                st.session_state.confirmed_ingredients = ""
 
+if "detected_ingredients" in st.session_state or st.session_state.get("manual_ingredients_mode"):
+    if st.session_state.get("manual_ingredients_mode"):
+        ingredients_text = st.text_area(
+            "Type ingredients separated by commas",
+            key="manual_ingredients_text",
+            value=st.session_state.get("confirmed_ingredients", ""),
+        )
+        if st.button("Suggest recipes", type="primary"):
+            ingredients = [item.strip() for item in ingredients_text.split(",") if item.strip()]
+            if not ingredients:
+                st.error("Add at least one ingredient to get recipe ideas.")
+            else:
+                recipe = build_local_recipe(ingredients, st.session_state.user_preferences)
+                st.session_state.messages = [{"role": "assistant", "kind": "text", "category": "recipe", "content": recipe}]
+    else:
+        uncertain = st.session_state.uncertain_ingredients
+        if uncertain:
+            st.info("I'm not sure about: " + ", ".join(uncertain))
+
+        ingredients_text = st.text_area(
+            "Check the ingredients and edit the list if needed",
+            key="confirmed_ingredients",
+        )
+        if st.button("Suggest recipes", type="primary"):
+            ingredients = [item.strip() for item in ingredients_text.split(",") if item.strip()]
+            if not ingredients:
+                st.error("Add at least one ingredient to get recipe ideas.")
+            else:
+                with st.spinner("Finding a few good things to make..."):
+                    try:
+                        recipe_response = generate_content(
+                            contents=RECIPE_PROMPT.format(
+                                ingredients=", ".join(ingredients),
+                                preferences=st.session_state.user_preferences,
+                            ),
+                            config=types.GenerateContentConfig(
+                                system_instruction=SYSTEM_PROMPT
+                            ),
+                        )
+                        recipe = (recipe_response.text or "").strip()
+                        if not recipe:
+                            st.error("I couldn't come up with a recipe just now. Please try again.")
+                        else:
+                            st.session_state.messages = [
+                                {
+                                    "role": "assistant",
+                                    "kind": "text",
+                                    "category": "recipe",
+                                    "content": recipe,
+                                }
+                            ]
+                    except Exception as error:
+                        if openai_client is None and gemini_client is None:
+                            recipe = build_local_recipe(ingredients, st.session_state.user_preferences)
+                            st.session_state.messages = [{"role": "assistant", "kind": "text", "category": "recipe", "content": recipe}]
+                        else:
+                            st.error(f"Recipe generation failed ({type(error).__name__}): {error}")
+
+messages = st.session_state.get("messages", [])
 assistant_messages = [
     message["content"]
-    for message in st.session_state.get("messages", [])
+    for message in messages
     if message.get("role") == "assistant"
     and message.get("category") == "recipe"
     and message.get("content")
@@ -204,9 +420,10 @@ if assistant_messages:
     latest_message = assistant_messages[-1]
     st.subheader("Recipe ideas")
     st.markdown(latest_message)
+    phone_number = st.session_state.get("whatsapp_phone_number", "")
     phone_digits = "".join(
         character
-        for character in st.session_state.whatsapp_phone_number
+        for character in phone_number
         if character.isdigit()
     )
     if phone_digits:
@@ -216,12 +433,16 @@ if assistant_messages:
         st.warning("Add a valid phone number, including its country code, to open WhatsApp.")
 else:
     st.button("Send latest recipe via WhatsApp", disabled=True)
+
+profile_name = st.session_state.get("profile_name", "Guest")
+phone_number = st.session_state.get("whatsapp_phone_number", "not set")
 st.caption(
-    f"Logged in as {st.session_state.profile_name} - "
-    f"updates go to {st.session_state.whatsapp_phone_number}"
+    f"Logged in as {profile_name} - "
+    f"updates go to {phone_number}"
 )
-if not st.session_state.messages:
-    add_message("assistant", "text",WELCOME_MESSAGE)
+
+if not messages:
+    add_message("assistant", "text", WELCOME_MESSAGE)
 else:
-    for message in st.session_state.messages:
+    for message in messages:
         render_message(message)
