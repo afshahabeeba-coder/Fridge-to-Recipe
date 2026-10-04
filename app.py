@@ -1,4 +1,3 @@
-import base64
 import json
 import time
 from urllib.parse import quote
@@ -8,10 +7,6 @@ from google import genai
 from google.genai import types
 from twilio.rest import Client as TwilioClient
 
-try:
-    from openai import OpenAI as OpenAIClient
-except ImportError:  # pragma: no cover
-    OpenAIClient = None
 from prompts import (
     SYSTEM_PROMPT,
     INGREDIENT_DETECTION_PROMPT,
@@ -27,7 +22,7 @@ def get_secret(name):
     return value
 
 
-OPENAI_API_KEY = (st.secrets.get("OPENAI_API_KEY") or "").strip()
+
 GEMINI_API_KEY = (st.secrets.get("GEMINI_API_KEY") or "").strip()
 
 try:
@@ -39,14 +34,11 @@ except RuntimeError as error:
     st.error(str(error))
     st.stop()
 
-openai_client = OpenAIClient(api_key=OPENAI_API_KEY) if OPENAI_API_KEY and OpenAIClient else None
-
-
 @st.cache_resource
-def get_gemini_client():
-    if not GEMINI_API_KEY:
+def get_gemini_client(api_key):
+    if not api_key:
         return None
-    return genai.Client(api_key=GEMINI_API_KEY)
+    return genai.Client(api_key=api_key)
 
 
 @st.cache_resource
@@ -54,9 +46,14 @@ def get_twilio_client():
     return TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 twilio_client = get_twilio_client()
-gemini_client = get_gemini_client()
-MODEL_NAME = "gemini-3.8-flash"
-FALLBACK_MODEL_NAME = "gemini-3.8-flash-lite"
+gemini_client = get_gemini_client(GEMINI_API_KEY)
+MODEL_NAME = "gemini-3.5-flash"
+FALLBACK_MODEL_NAMES = (
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+)
 
 
 class LocalResponse:
@@ -116,7 +113,11 @@ def get_available_gemini_models():
             name = getattr(model, "name", str(model))
             if isinstance(name, str):
                 name = name.split("/")[-1]
-            if name:
+            supported_actions = getattr(model, "supported_actions", None)
+            if name and (
+                supported_actions is None
+                or "generateContent" in supported_actions
+            ):
                 models.append(name)
         return models
     except Exception:
@@ -125,82 +126,24 @@ def get_available_gemini_models():
 
 def get_gemini_model_candidates():
     seen = set()
-    for model_name in (MODEL_NAME, FALLBACK_MODEL_NAME, "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-pro"):
+    for model_name in (
+        MODEL_NAME,
+        *get_available_gemini_models(),
+        *FALLBACK_MODEL_NAMES,
+    ):
         if model_name and model_name not in seen:
             seen.add(model_name)
             yield model_name
-
-    for model_name in get_available_gemini_models():
-        if model_name and model_name not in seen:
-            seen.add(model_name)
-            yield model_name
-
-
-def build_openai_message(contents):
-    message_content = []
-    for item in contents if isinstance(contents, list) else [contents]:
-        if isinstance(item, str):
-            message_content.append({"type": "text", "text": item})
-        elif hasattr(item, "inline_data") and getattr(item, "inline_data", None) is not None:
-            inline_data = item.inline_data
-            mime_type = getattr(inline_data, "mime_type", None) or "image/jpeg"
-            image_bytes = getattr(inline_data, "data", b"")
-            if isinstance(image_bytes, memoryview):
-                image_bytes = image_bytes.tobytes()
-            base64_image = base64.b64encode(image_bytes).decode("utf-8")
-            message_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime_type};base64,{base64_image}",
-                    },
-                }
-            )
-    return [{"role": "user", "content": message_content}]
-
-
-class OpenAIResponse:
-    def __init__(self, text):
-        self.text = text
-
-
-def generate_openai_content(contents, config=None):
-    messages = build_openai_message(contents)
-    text_prompt = ""
-    if isinstance(contents, list):
-        text_prompt = next((item for item in contents if isinstance(item, str)), "")
-    else:
-        text_prompt = contents if isinstance(contents, str) else ""
-
-    if not text_prompt and len(messages[0]["content"]) > 0:
-        for part in messages[0]["content"]:
-            if part.get("type") == "text":
-                text_prompt = part.get("text", "")
-                break
-
-    response = openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages,
-        response_format={"type": "json_object"} if "ingredients" in text_prompt.lower() or "json" in text_prompt.lower() else None,
-    )
-    output = response.choices[0].message.content
-    return OpenAIResponse(output)
 
 
 def generate_content(contents, config=None):
-    if openai_client is not None:
-        try:
-            return generate_openai_content(contents, config)
-        except Exception:
-            st.warning("OpenAI fallback is active, but the request failed; retrying with Gemini only if a Gemini key is configured.")
-
     if gemini_client is None:
         if isinstance(contents, str) and "The user confirmed these ingredients" in contents:
             return LocalResponse(build_local_recipe([item.strip() for item in contents.split("The user confirmed these ingredients:", 1)[1].split("\n", 1)[0].split(",") if item.strip()]))
-        raise RuntimeError("No AI provider is configured. Add a valid OpenAI key or a valid Gemini API key.")
+        raise RuntimeError("No Gemini API key is configured.")
 
     candidates = list(get_gemini_model_candidates())
-    last_model = candidates[-1] if candidates else FALLBACK_MODEL_NAME
+    last_model = candidates[-1] if candidates else FALLBACK_MODEL_NAMES[-1]
 
     for model_name in candidates:
         try:
@@ -309,7 +252,7 @@ if "manual_ingredients_mode" not in st.session_state:
     st.session_state.manual_ingredients_mode = False
 
 if uploaded_file and st.button("Identify ingredients"):
-    if openai_client is None and gemini_client is None:
+    if gemini_client is None:
         st.session_state.manual_ingredients_mode = True
         st.session_state.detected_ingredients = []
         st.session_state.uncertain_ingredients = []
@@ -343,6 +286,12 @@ if uploaded_file and st.button("Identify ingredients"):
                     st.error(
                         "The AI image analysis is temporarily unavailable because Gemini quota or service capacity was reached. "
                         "Please try again in a few minutes, or switch to a different Google AI plan and model."
+                    )
+                elif error_code in (401, "401") or "access_token_type_unsupported" in str(error).lower():
+                    st.error(
+                        "Gemini rejected its credentials. Set GEMINI_API_KEY to a valid "
+                        "Gemini Developer API key from Google AI Studio, not an OAuth access token. "
+                        "You can enter ingredients manually below."
                     )
                 else:
                     st.error(f"Photo analysis failed ({type(error).__name__}): {error}")
@@ -401,11 +350,19 @@ if "detected_ingredients" in st.session_state or st.session_state.get("manual_in
                                 }
                             ]
                     except Exception as error:
-                        if openai_client is None and gemini_client is None:
-                            recipe = build_local_recipe(ingredients, st.session_state.user_preferences)
-                            st.session_state.messages = [{"role": "assistant", "kind": "text", "category": "recipe", "content": recipe}]
-                        else:
-                            st.error(f"Recipe generation failed ({type(error).__name__}): {error}")
+                        st.warning(
+                            f"Recipe generation failed ({type(error).__name__}); "
+                            "showing a local suggestion instead."
+                        )
+                        recipe = build_local_recipe(
+                            ingredients, st.session_state.user_preferences
+                        )
+                        st.session_state.messages = [{
+                            "role": "assistant",
+                            "kind": "text",
+                            "category": "recipe",
+                            "content": recipe,
+                        }]
 
 messages = st.session_state.get("messages", [])
 assistant_messages = [
