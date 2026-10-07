@@ -377,17 +377,8 @@ if assistant_messages:
     latest_message = assistant_messages[-1]
     st.subheader("Recipe ideas")
     st.markdown(latest_message)
-    phone_number = st.session_state.get("whatsapp_phone_number", "")
-    phone_digits = "".join(
-        character
-        for character in phone_number
-        if character.isdigit()
-    )
-    if phone_digits:
-        whatsapp_url = f"https://wa.me/{phone_digits}?text={quote(latest_message, safe='')}"
-        st.link_button("Send latest recipe via WhatsApp", whatsapp_url)
-    else:
-        st.warning("Add a valid phone number, including its country code, to open WhatsApp.")
+    whatsapp_url = f"https://wa.me/?text={quote(latest_message, safe='')}"
+    st.link_button("Send latest recipe via WhatsApp", whatsapp_url)
 else:
     st.button("Send latest recipe via WhatsApp", disabled=True)
 
